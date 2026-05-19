@@ -280,7 +280,9 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
     }
 
     private func makeModulesTab() -> NSTabViewItem {
-        var views: [NSView] = []
+        var views:   [NSView]                        = []
+        var entries: [(entry: NSStackView, label: NSTextField)] = []
+
         for (idx, desc) in ModuleRegistry.available.enumerated() {
             let isActive = moduleRegistry.active.contains(where: { $0.id == desc.id })
             let checkbox = NSButton(checkboxWithTitle: desc.displayName, target: self,
@@ -297,18 +299,38 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
             entry.alignment   = .leading
             entry.spacing     = 3
             views.append(entry)
+            entries.append((entry, descLabel))
         }
 
         let stack = NSStackView(views: views)
-        stack.orientation    = .vertical
-        stack.alignment      = .leading
-        stack.spacing        = 16
-        stack.edgeInsets     = NSEdgeInsets(top: 20, left: 20, bottom: 20, right: 20)
-        stack.autoresizingMask = [.width, .height]
+        stack.orientation = .vertical
+        stack.alignment   = .leading
+        stack.spacing     = 16
+        stack.edgeInsets  = NSEdgeInsets(top: 20, left: 20, bottom: 20, right: 20)
+        stack.translatesAutoresizingMaskIntoConstraints = false
+
+        let wrapper = NSView()
+        wrapper.autoresizingMask = [.width, .height]
+        wrapper.addSubview(stack)
+
+        // Pin stack to wrapper so its widthAnchor is resolvable
+        NSLayoutConstraint.activate([
+            stack.topAnchor.constraint(equalTo: wrapper.topAnchor),
+            stack.leadingAnchor.constraint(equalTo: wrapper.leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: wrapper.trailingAnchor),
+        ])
+
+        // .leading stacks don't generate trailing constraints for children, so wrapping
+        // labels never get a finite width to break at. Force entries and their labels
+        // to span the full internal width of the stack (stack width minus 20+20 insets).
+        for (entry, descLabel) in entries {
+            entry.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -40).isActive = true
+            descLabel.widthAnchor.constraint(equalTo: entry.widthAnchor).isActive = true
+        }
 
         let item = NSTabViewItem()
         item.label = "Modules"
-        item.view  = stack
+        item.view  = wrapper
         return item
     }
 
@@ -320,20 +342,33 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
             "Create automations triggered by USB, Bluetooth, or Thunderbolt events.")
         sub.font      = .systemFont(ofSize: 12)
         sub.textColor = .secondaryLabelColor
+        // Low hugging so the width constraint below wins over intrinsic size
+        sub.setContentHuggingPriority(.defaultLow, for: .horizontal)
 
         let addButton = NSButton(title: "+ Add Latch", target: self, action: #selector(addLatchTapped))
         addButton.bezelStyle = .rounded
 
         let stack = NSStackView(views: [header, sub, addButton])
-        stack.orientation    = .vertical
-        stack.alignment      = .leading
-        stack.spacing        = 12
-        stack.edgeInsets     = NSEdgeInsets(top: 20, left: 20, bottom: 20, right: 20)
-        stack.autoresizingMask = [.width, .height]
+        stack.orientation = .vertical
+        stack.alignment   = .leading
+        stack.spacing     = 12
+        stack.edgeInsets  = NSEdgeInsets(top: 20, left: 20, bottom: 20, right: 20)
+        stack.translatesAutoresizingMaskIntoConstraints = false
+
+        let wrapper = NSView()
+        wrapper.autoresizingMask = [.width, .height]
+        wrapper.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.topAnchor.constraint(equalTo: wrapper.topAnchor),
+            stack.leadingAnchor.constraint(equalTo: wrapper.leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: wrapper.trailingAnchor),
+            // Constrain sub to the stack's internal width so it has a finite width to wrap at
+            sub.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -40),
+        ])
 
         let item = NSTabViewItem()
         item.label = "My Latches"
-        item.view  = stack
+        item.view  = wrapper
         return item
     }
 
