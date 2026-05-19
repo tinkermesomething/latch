@@ -87,13 +87,18 @@ final class UserModuleRunner: NSObject, Automation {
             if isEnabled { stop() }
             return
         }
-        let wasRunning = isEnabled  // use runtime flag, not config flag (B3)
+        let wasRunning = isEnabled  // use runtime flag, not config flag
+        // Check before assigning so we can compare old vs new trigger
+        let triggerChanged = updated.trigger.eventType       != moduleConfig.trigger.eventType
+                          || updated.trigger.deviceVendorID  != moduleConfig.trigger.deviceVendorID
+                          || updated.trigger.deviceProductID != moduleConfig.trigger.deviceProductID
+                          || updated.trigger.bluetoothAddress != moduleConfig.trigger.bluetoothAddress
         moduleConfig = updated
         if updated.enabled && !wasRunning { start(); return }
         if !updated.enabled && wasRunning { stop();  return }
-        // Module stays enabled — restart to rebuild IOKit matching dict with updated
-        // trigger criteria (device VID/PID, BT address). Notifications/actions read live.
-        if isEnabled { stop(); start() }
+        // Only restart monitors if trigger criteria changed — IOKit matching dict must be rebuilt.
+        // Notification flags and actions are read live from moduleConfig; no restart needed.
+        if isEnabled && triggerChanged { stop(); start() }
     }
 
     // MARK: - USB Monitoring
@@ -406,37 +411,48 @@ final class UserModuleRunner: NSObject, Automation {
 
         case .runScript:
             guard let path = action.scriptPath else { return }
-            // Re-entrancy guard — check the right slot without inout
-            let current: Process? = slot == .connect ? connectScriptProcess : disconnectScriptProcess
-            if current?.isRunning == true {
-                log("UserModule[\(moduleConfig.name)]: Script already running — skipping")
-                return
-            }
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: "/bin/zsh")
-            process.arguments     = ["-c", path]
-            // terminationHandler fires on an arbitrary thread — always dispatch to main
-            process.terminationHandler = { [weak self] p in
-                DispatchQueue.main.async {
-                    guard let self else { return }
-                    log("UserModule[\(self.moduleConfig.name)]: Script exited (\(p.terminationStatus))")
-                    switch slot {
-                    case .connect:    if self.connectScriptProcess    === p { self.connectScriptProcess    = nil }
-                    case .disconnect: if self.disconnectScriptProcess === p { self.disconnectScriptProcess = nil }
-                    }
-                }
-            }
-            do {
-                try process.run()
+            runProcess(args: ["-c", path], slot: slot,
+                       logTag: "Script launched — \(path)",
+                       degradedMsg: "Script failed: \(URL(fileURLWithPath: path).lastPathComponent)")
+
+        case .runCommand:
+            guard let cmd = action.command, !cmd.trimmingCharacters(in: .whitespaces).isEmpty else { return }
+            runProcess(args: ["-c", cmd], slot: slot,
+                       logTag: "Command launched — \(cmd)",
+                       degradedMsg: "Command failed")
+        }
+    }
+
+    private func runProcess(args: [String], slot: ScriptSlot, logTag: String, degradedMsg: String) {
+        let current: Process? = slot == .connect ? connectScriptProcess : disconnectScriptProcess
+        if current?.isRunning == true {
+            log("UserModule[\(moduleConfig.name)]: Process already running — skipping")
+            return
+        }
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/zsh")
+        process.arguments     = args
+        // terminationHandler fires on an arbitrary thread — always dispatch to main
+        process.terminationHandler = { [weak self] p in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                log("UserModule[\(self.moduleConfig.name)]: Process exited (\(p.terminationStatus))")
                 switch slot {
-                case .connect:    connectScriptProcess    = process
-                case .disconnect: disconnectScriptProcess = process
+                case .connect:    if self.connectScriptProcess    === p { self.connectScriptProcess    = nil }
+                case .disconnect: if self.disconnectScriptProcess === p { self.disconnectScriptProcess = nil }
                 }
-                log("UserModule[\(moduleConfig.name)]: Script launched — \(path)")
-            } catch {
-                log("UserModule[\(moduleConfig.name)]: Script launch failed — \(error.localizedDescription)")
-                status = .degraded("Script failed: \(URL(fileURLWithPath: path).lastPathComponent)")
             }
+        }
+        do {
+            try process.run()
+            switch slot {
+            case .connect:    connectScriptProcess    = process
+            case .disconnect: disconnectScriptProcess = process
+            }
+            log("UserModule[\(moduleConfig.name)]: \(logTag)")
+        } catch {
+            log("UserModule[\(moduleConfig.name)]: Process launch failed — \(error.localizedDescription)")
+            status = .degraded(degradedMsg)
         }
     }
 }

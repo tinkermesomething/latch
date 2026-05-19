@@ -1,4 +1,6 @@
 import AppKit
+import IOKit
+import IOKit.usb
 import IOBluetooth
 
 // MARK: - UserModuleWizardController
@@ -48,15 +50,26 @@ final class UserModuleWizardController: NSWindowController {
     private var bluetoothRadio: NSButton!
     private var thunderboltRadio: NSButton!
 
-    // Step 2 — Device picker
-    private var deviceTable:       NSTableView!
-    private var deviceTableScroll: NSScrollView!
-    private var anyDeviceRow:      NSTableRowView?
-    private var scannedUSBDevices:  [DiscoveredUSBDevice]             = []
-    private var scannedBTDevices:   [DiscoveredBluetoothDevice]       = []
-    private var selectedDeviceIndex: Int = 0  // 0 = "any device"
-    private var devicePickerLabel: NSTextField!
-    private var tbNoteLabel: NSTextField!
+    // Step 2 — Device detection
+    private var devicePickerLabel:  NSTextField!
+    private var detectStatusLabel:  NSTextField!
+    private var detectButton:       NSButton!
+    private var anyDeviceCheckbox:  NSButton!
+    private var tbNoteLabel:        NSTextField!
+
+    // IOKit detect state (USB)
+    private var wizardDetectPort:    IONotificationPortRef?
+    private var wizardDetectIter:    io_iterator_t = IO_OBJECT_NULL
+    private var wizardDetectCtx:     UnsafeMutableRawPointer?
+    private var wizardDetectTimeout: DispatchWorkItem?
+    // BT detect state
+    private var wizardBTObserver:    IOBluetoothUserNotification?
+
+    // Detected device result
+    private var detectedVendorID:   Int?
+    private var detectedProductID:  Int?
+    private var detectedBTAddress:  String?
+    private var detectedDeviceName: String?
 
     // Step 3 — On-connect action
     private var connectActionSegment: NSSegmentedControl!
@@ -64,6 +77,7 @@ final class UserModuleWizardController: NSWindowController {
     private var connectAppBrowse:     NSButton!
     private var connectScriptField:   NSTextField!
     private var connectScriptBrowse:  NSButton!
+    private var connectCommandField:  NSTextField!
     private var connectAppBundleID:   String?
     private var connectAppName:       String?
 
@@ -73,6 +87,7 @@ final class UserModuleWizardController: NSWindowController {
     private var disconnectAppBrowse:     NSButton!
     private var disconnectScriptField:   NSTextField!
     private var disconnectScriptBrowse:  NSButton!
+    private var disconnectCommandField:  NSTextField!
     private var disconnectAppBundleID:   String?
     private var disconnectAppName:       String?
 
@@ -92,8 +107,9 @@ final class UserModuleWizardController: NSWindowController {
             backing:     .buffered,
             defer:       false
         )
-        w.title = "New Automation"
+        w.title = "New Latch"
         w.isReleasedWhenClosed = false
+        w.delegate = self
 
         let content = w.contentView!
 
@@ -183,14 +199,14 @@ final class UserModuleWizardController: NSWindowController {
         let v = NSView()
         v.translatesAutoresizingMaskIntoConstraints = false
 
-        let title = stepTitle("Name your automation")
+        let title = stepTitle("Name your latch")
         v.addSubview(title)
 
-        let sub = stepSubtitle("Give this module a short, descriptive name.")
+        let sub = stepSubtitle("Give this latch a short, descriptive name.")
         v.addSubview(sub)
 
         nameField = NSTextField()
-        nameField.placeholderString = "e.g. Studio Monitor Launcher"
+        nameField.placeholderString = "e.g. Studio Monitor"
         nameField.translatesAutoresizingMaskIntoConstraints = false
         v.addSubview(nameField)
 
@@ -256,33 +272,29 @@ final class UserModuleWizardController: NSWindowController {
         devicePickerLabel = stepSubtitle("")
         v.addSubview(devicePickerLabel)
 
-        // Thunderbolt note (shown instead of table)
+        detectStatusLabel = NSTextField(labelWithString: "No device detected yet.")
+        detectStatusLabel.font = .systemFont(ofSize: 13)
+        detectStatusLabel.translatesAutoresizingMaskIntoConstraints = false
+        v.addSubview(detectStatusLabel)
+
+        detectButton = NSButton(title: "Detect Device…", target: self, action: #selector(detectTapped))
+        detectButton.bezelStyle = .rounded
+        detectButton.translatesAutoresizingMaskIntoConstraints = false
+        v.addSubview(detectButton)
+
+        anyDeviceCheckbox = NSButton(checkboxWithTitle: "", target: self, action: #selector(anyDeviceToggled(_:)))
+        anyDeviceCheckbox.translatesAutoresizingMaskIntoConstraints = false
+        v.addSubview(anyDeviceCheckbox)
+
+        // Thunderbolt note — shown instead of detect UI for TB triggers
         tbNoteLabel = NSTextField(wrappingLabelWithString:
             "Thunderbolt triggers fire whenever any Thunderbolt device connects or disconnects. " +
             "Specific device matching is not supported in this release.")
-        tbNoteLabel.font = .systemFont(ofSize: 13)
+        tbNoteLabel.font      = .systemFont(ofSize: 13)
         tbNoteLabel.textColor = .secondaryLabelColor
         tbNoteLabel.translatesAutoresizingMaskIntoConstraints = false
-        tbNoteLabel.isHidden = true
+        tbNoteLabel.isHidden  = true
         v.addSubview(tbNoteLabel)
-
-        // Device table
-        deviceTable = NSTableView()
-        deviceTable.headerView = nil
-        deviceTable.rowHeight  = 22
-        let col = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("device"))
-        col.title = "Device"
-        deviceTable.addTableColumn(col)
-        deviceTable.dataSource = self
-        deviceTable.delegate   = self
-
-        deviceTableScroll = NSScrollView()
-        deviceTableScroll.documentView         = deviceTable
-        deviceTableScroll.hasVerticalScroller  = true
-        deviceTableScroll.autohidesScrollers   = true
-        deviceTableScroll.borderType           = .bezelBorder
-        deviceTableScroll.translatesAutoresizingMaskIntoConstraints = false
-        v.addSubview(deviceTableScroll)
 
         NSLayoutConstraint.activate([
             title.topAnchor.constraint(equalTo: v.topAnchor),
@@ -292,10 +304,15 @@ final class UserModuleWizardController: NSWindowController {
             devicePickerLabel.topAnchor.constraint(equalTo: title.bottomAnchor, constant: 6),
             devicePickerLabel.leadingAnchor.constraint(equalTo: v.leadingAnchor),
 
-            deviceTableScroll.topAnchor.constraint(equalTo: devicePickerLabel.bottomAnchor, constant: 10),
-            deviceTableScroll.leadingAnchor.constraint(equalTo: v.leadingAnchor),
-            deviceTableScroll.trailingAnchor.constraint(equalTo: v.trailingAnchor),
-            deviceTableScroll.heightAnchor.constraint(equalToConstant: 160),
+            detectStatusLabel.topAnchor.constraint(equalTo: devicePickerLabel.bottomAnchor, constant: 20),
+            detectStatusLabel.leadingAnchor.constraint(equalTo: v.leadingAnchor),
+            detectStatusLabel.trailingAnchor.constraint(equalTo: v.trailingAnchor),
+
+            detectButton.topAnchor.constraint(equalTo: detectStatusLabel.bottomAnchor, constant: 12),
+            detectButton.leadingAnchor.constraint(equalTo: v.leadingAnchor),
+
+            anyDeviceCheckbox.topAnchor.constraint(equalTo: detectButton.bottomAnchor, constant: 16),
+            anyDeviceCheckbox.leadingAnchor.constraint(equalTo: v.leadingAnchor),
 
             tbNoteLabel.topAnchor.constraint(equalTo: devicePickerLabel.bottomAnchor, constant: 12),
             tbNoteLabel.leadingAnchor.constraint(equalTo: v.leadingAnchor),
@@ -315,9 +332,9 @@ final class UserModuleWizardController: NSWindowController {
         let sub = stepSubtitle("What should latch do when the device \(event)?")
         v.addSubview(sub)
 
-        // Segment: None | Launch App | Quit App | Run Script
+        // Segment: None | Launch App | Quit App | Run Script | Run Command
         let seg = NSSegmentedControl(
-            labels: ["None", "Launch App", "Quit App", "Run Script"],
+            labels: ["None", "Launch App", "Quit App", "Run Script", "Run Command"],
             trackingMode: .selectOne,
             target: self,
             action: isConnect ? #selector(connectActionChanged) : #selector(disconnectActionChanged)
@@ -359,12 +376,23 @@ final class UserModuleWizardController: NSWindowController {
         scriptBrowse.isHidden = true
         v.addSubview(scriptBrowse)
 
+        // Command row (inline editable text field)
+        let commandField = NSTextField()
+        commandField.isEditable        = true
+        commandField.isSelectable      = true
+        commandField.placeholderString = "e.g. open -a Safari"
+        commandField.translatesAutoresizingMaskIntoConstraints = false
+        commandField.isHidden = true
+        v.addSubview(commandField)
+
         if isConnect {
             connectAppField = appField; connectAppBrowse = appBrowse
             connectScriptField = scriptField; connectScriptBrowse = scriptBrowse
+            connectCommandField = commandField
         } else {
             disconnectAppField = appField; disconnectAppBrowse = appBrowse
             disconnectScriptField = scriptField; disconnectScriptBrowse = scriptBrowse
+            disconnectCommandField = commandField
         }
 
         NSLayoutConstraint.activate([
@@ -393,6 +421,10 @@ final class UserModuleWizardController: NSWindowController {
             scriptBrowse.centerYAnchor.constraint(equalTo: scriptField.centerYAnchor),
             scriptBrowse.trailingAnchor.constraint(equalTo: v.trailingAnchor),
             scriptBrowse.widthAnchor.constraint(equalToConstant: 80),
+
+            commandField.topAnchor.constraint(equalTo: seg.bottomAnchor, constant: 14),
+            commandField.leadingAnchor.constraint(equalTo: v.leadingAnchor),
+            commandField.trailingAnchor.constraint(equalTo: v.trailingAnchor),
         ])
         return v
     }
@@ -404,7 +436,7 @@ final class UserModuleWizardController: NSWindowController {
         let title = stepTitle("Notifications")
         v.addSubview(title)
 
-        let sub = stepSubtitle("Choose when latch should notify you.")
+        let sub = stepSubtitle("Choose when latch should send a notification.")
         v.addSubview(sub)
 
         notifyConnectCheck    = NSButton(checkboxWithTitle: "Notify when device connects",
@@ -462,6 +494,8 @@ final class UserModuleWizardController: NSWindowController {
     // MARK: - Step navigation
 
     private func goToStep(_ step: Int) {
+        // Stop device detection if navigating away from step 2
+        if currentStep == 2 && step != 2 { stopWizardDetection() }
         currentStep = step
 
         // Swap content
@@ -472,6 +506,7 @@ final class UserModuleWizardController: NSWindowController {
             view.topAnchor.constraint(equalTo: contentBox.topAnchor),
             view.leadingAnchor.constraint(equalTo: contentBox.leadingAnchor),
             view.trailingAnchor.constraint(equalTo: contentBox.trailingAnchor),
+            view.bottomAnchor.constraint(equalTo: contentBox.bottomAnchor),
         ])
 
         stepLabel.stringValue = "Step \(step + 1) of \(stepViews.count)"
@@ -485,7 +520,7 @@ final class UserModuleWizardController: NSWindowController {
         if step == 2 { prepareDeviceStep() }
         if step == stepViews.count - 1 { updateReview() }
 
-        window?.title = editing != nil ? "Edit Automation" : "New Automation"
+        window?.title = editing != nil ? "Edit Latch" : "New Latch"
     }
 
     @objc private func backTapped() {
@@ -506,46 +541,58 @@ final class UserModuleWizardController: NSWindowController {
 
     private func prepareDeviceStep() {
         let eventType = selectedEventType()
-        selectedDeviceIndex = 0
+        stopWizardDetection()
 
         switch eventType {
+        case .thunderbolt:
+            tbNoteLabel.isHidden       = false
+            detectButton.isHidden      = true
+            anyDeviceCheckbox.isHidden = true
+            detectStatusLabel.isHidden = true
+            devicePickerLabel.stringValue = "Thunderbolt trigger"
+            return
+
         case .usb:
-            deviceTableScroll.isHidden = false
             tbNoteLabel.isHidden       = true
-            devicePickerLabel.stringValue = "Select a connected USB device, or choose \"Any USB device\"."
-            scannedUSBDevices = DeviceScanner.connectedUSBDevices()
-            scannedBTDevices  = []
-            deviceTable.reloadData()
-            // Pre-select the previously configured device if it's still connected
-            var rowToSelect = 0
-            if let vid = editing?.trigger.deviceVendorID,
-               let pid = editing?.trigger.deviceProductID,
-               let idx = scannedUSBDevices.firstIndex(where: { $0.vendorID == vid && $0.productID == pid }) {
-                rowToSelect = idx + 1  // +1 for "Any device" sentinel row
-            }
-            selectedDeviceIndex = rowToSelect
-            deviceTable.selectRowIndexes(IndexSet(integer: rowToSelect), byExtendingSelection: false)
+            detectButton.isHidden      = false
+            anyDeviceCheckbox.isHidden = false
+            detectStatusLabel.isHidden = false
+            devicePickerLabel.stringValue = "Plug in the USB device you want to trigger this latch."
+            anyDeviceCheckbox.title = "Match any USB device"
 
         case .bluetooth:
-            deviceTableScroll.isHidden = false
             tbNoteLabel.isHidden       = true
-            devicePickerLabel.stringValue = "Select a paired Bluetooth device, or choose \"Any Bluetooth device\"."
-            scannedBTDevices  = DeviceScanner.pairedBluetoothDevices()
-            scannedUSBDevices = []
-            deviceTable.reloadData()
-            // Pre-select the previously configured device if it's still paired
-            var rowToSelect = 0
-            if let addr = editing?.trigger.bluetoothAddress,
-               let idx = scannedBTDevices.firstIndex(where: { $0.address == addr }) {
-                rowToSelect = idx + 1
-            }
-            selectedDeviceIndex = rowToSelect
-            deviceTable.selectRowIndexes(IndexSet(integer: rowToSelect), byExtendingSelection: false)
+            detectButton.isHidden      = false
+            anyDeviceCheckbox.isHidden = false
+            detectStatusLabel.isHidden = false
+            devicePickerLabel.stringValue = "Connect the Bluetooth device you want to trigger this latch."
+            anyDeviceCheckbox.title = "Match any Bluetooth device"
+        }
 
-        case .thunderbolt:
-            deviceTableScroll.isHidden = true
-            tbNoteLabel.isHidden       = false
-            devicePickerLabel.stringValue = "Thunderbolt trigger"
+        // Pre-populate from edit config, or reset for new module
+        if let mod = editing, mod.trigger.eventType == eventType {
+            let hasSpecific = (eventType == .usb && mod.trigger.deviceVendorID != nil)
+                           || (eventType == .bluetooth && mod.trigger.bluetoothAddress != nil)
+            if hasSpecific {
+                detectedVendorID   = mod.trigger.deviceVendorID
+                detectedProductID  = mod.trigger.deviceProductID
+                detectedBTAddress  = mod.trigger.bluetoothAddress
+                detectedDeviceName = mod.trigger.deviceName
+                detectStatusLabel.stringValue = "✓ \(mod.trigger.deviceName)"
+                anyDeviceCheckbox.state = .off
+                detectButton.isEnabled  = true
+            } else {
+                // "any device" was configured
+                anyDeviceCheckbox.state = .on
+                detectButton.isEnabled  = false
+                detectStatusLabel.stringValue = "Any \(eventType.rawValue.capitalized) device"
+            }
+        } else {
+            detectedVendorID = nil; detectedProductID = nil
+            detectedBTAddress = nil; detectedDeviceName = nil
+            anyDeviceCheckbox.state = .off
+            detectButton.isEnabled  = true
+            detectStatusLabel.stringValue = "No device detected yet."
         }
     }
 
@@ -554,26 +601,31 @@ final class UserModuleWizardController: NSWindowController {
     @objc private func connectActionChanged() {
         updateActionVisibility(segment: connectActionSegment,
                                 appField: connectAppField, appBrowse: connectAppBrowse,
-                                scriptField: connectScriptField, scriptBrowse: connectScriptBrowse)
+                                scriptField: connectScriptField, scriptBrowse: connectScriptBrowse,
+                                commandField: connectCommandField)
     }
 
     @objc private func disconnectActionChanged() {
         updateActionVisibility(segment: disconnectActionSegment,
                                 appField: disconnectAppField, appBrowse: disconnectAppBrowse,
-                                scriptField: disconnectScriptField, scriptBrowse: disconnectScriptBrowse)
+                                scriptField: disconnectScriptField, scriptBrowse: disconnectScriptBrowse,
+                                commandField: disconnectCommandField)
     }
 
     private func updateActionVisibility(segment: NSSegmentedControl,
                                          appField: NSTextField, appBrowse: NSButton,
-                                         scriptField: NSTextField, scriptBrowse: NSButton) {
+                                         scriptField: NSTextField, scriptBrowse: NSButton,
+                                         commandField: NSTextField) {
         let sel = segment.selectedSegment
-        // 0=None, 1=Launch App, 2=Quit App, 3=Run Script
-        let showApp    = sel == 1 || sel == 2
-        let showScript = sel == 3
-        appField.isHidden    = !showApp
-        appBrowse.isHidden   = !showApp
-        scriptField.isHidden = !showScript
+        // 0=None, 1=Launch App, 2=Quit App, 3=Run Script, 4=Run Command
+        let showApp     = sel == 1 || sel == 2
+        let showScript  = sel == 3
+        let showCommand = sel == 4
+        appField.isHidden     = !showApp
+        appBrowse.isHidden    = !showApp
+        scriptField.isHidden  = !showScript
         scriptBrowse.isHidden = !showScript
+        commandField.isHidden = !showCommand
     }
 
     // MARK: - App / Script browse
@@ -628,7 +680,7 @@ final class UserModuleWizardController: NSWindowController {
         case 0:
             let name = nameField.stringValue.trimmingCharacters(in: .whitespaces)
             guard !name.isEmpty else {
-                showError("Please enter a name for this automation.")
+                showError("Please enter a name for this latch.")
                 return false
             }
             // Unique name check (allow same name when editing the same module)
@@ -636,7 +688,17 @@ final class UserModuleWizardController: NSWindowController {
                 .filter { $0.id != editing?.id }
                 .map    { $0.name }
             if existing.contains(name) {
-                showError("An automation named \"\(name)\" already exists. Choose a different name.")
+                showError("A latch named \"\(name)\" already exists. Choose a different name.")
+                return false
+            }
+            return true
+
+        case 2:
+            let eventType = selectedEventType()
+            if eventType == .thunderbolt { return true }
+            if anyDeviceCheckbox.state == .on { return true }
+            guard detectedDeviceName != nil else {
+                showError("Please detect a specific device, or check \"Match any\" to continue.")
                 return false
             }
             return true
@@ -661,6 +723,14 @@ final class UserModuleWizardController: NSWindowController {
                 }
                 guard access(path, X_OK) == 0 else {
                     showError("Script is not executable. Run: chmod +x \"\(path)\"")
+                    return false
+                }
+            } else if sel == 4 {
+                let cmd = isConnect
+                    ? connectCommandField.stringValue
+                    : disconnectCommandField.stringValue
+                guard !cmd.trimmingCharacters(in: .whitespaces).isEmpty else {
+                    showError("Please enter a command to run.")
                     return false
                 }
             }
@@ -698,19 +768,9 @@ final class UserModuleWizardController: NSWindowController {
 
     private func deviceDisplayName() -> String {
         let eventType = selectedEventType()
-        switch eventType {
-        case .thunderbolt: return "Any Thunderbolt device"
-        case .usb:
-            if selectedDeviceIndex == 0 { return "Any USB device" }
-            let idx = selectedDeviceIndex - 1
-            guard idx < scannedUSBDevices.count else { return "Any USB device" }
-            return scannedUSBDevices[idx].name
-        case .bluetooth:
-            if selectedDeviceIndex == 0 { return "Any Bluetooth device" }
-            let idx = selectedDeviceIndex - 1
-            guard idx < scannedBTDevices.count else { return "Any Bluetooth device" }
-            return scannedBTDevices[idx].name
-        }
+        if eventType == .thunderbolt { return "Any Thunderbolt device" }
+        if anyDeviceCheckbox.state == .on { return "Any \(eventType.rawValue.capitalized) device" }
+        return detectedDeviceName ?? "Any \(eventType.rawValue.capitalized) device"
     }
 
     private func actionSummary(isConnect: Bool) -> String {
@@ -726,6 +786,10 @@ final class UserModuleWizardController: NSWindowController {
         case 3:
             let path = isConnect ? connectScriptField.stringValue : disconnectScriptField.stringValue
             return "Run \(URL(fileURLWithPath: path).lastPathComponent)"
+        case 4:
+            let cmd = isConnect ? connectCommandField.stringValue : disconnectCommandField.stringValue
+            let preview = String(cmd.prefix(30))
+            return "Command: \(preview)\(cmd.count > 30 ? "…" : "")"
         default: return "None"
         }
     }
@@ -765,34 +829,13 @@ final class UserModuleWizardController: NSWindowController {
     }
 
     private func buildTrigger(eventType: TriggerEventType) -> UserModuleTrigger {
-        var vid:     Int?    = nil
-        var pid:     Int?    = nil
-        var btAddr:  String? = nil
-        var devName: String  = "Any \(eventType.rawValue.capitalized) device"
-
-        switch eventType {
-        case .usb:
-            if selectedDeviceIndex > 0 {
-                let idx = selectedDeviceIndex - 1
-                if idx < scannedUSBDevices.count {
-                    let d = scannedUSBDevices[idx]
-                    vid     = d.vendorID
-                    pid     = d.productID
-                    devName = d.name
-                }
-            }
-        case .bluetooth:
-            if selectedDeviceIndex > 0 {
-                let idx = selectedDeviceIndex - 1
-                if idx < scannedBTDevices.count {
-                    let d = scannedBTDevices[idx]
-                    btAddr  = d.address
-                    devName = d.name
-                }
-            }
-        case .thunderbolt:
-            devName = "Any Thunderbolt device"
-        }
+        let anyDevice = (eventType != .thunderbolt) && (anyDeviceCheckbox.state == .on)
+        let vid:    Int?    = anyDevice ? nil : detectedVendorID
+        let pid:    Int?    = anyDevice ? nil : detectedProductID
+        let btAddr: String? = anyDevice ? nil : detectedBTAddress
+        let devName: String = anyDevice || eventType == .thunderbolt
+            ? "Any \(eventType.rawValue.capitalized) device"
+            : (detectedDeviceName ?? "Any \(eventType.rawValue.capitalized) device")
 
         return UserModuleTrigger(
             eventType:        eventType,
@@ -823,6 +866,11 @@ final class UserModuleWizardController: NSWindowController {
                 kind:       .runScript,
                 scriptPath: isConnect ? connectScriptField.stringValue : disconnectScriptField.stringValue
             )
+        case 4:
+            return UserModuleAction(
+                kind:    .runCommand,
+                command: isConnect ? connectCommandField.stringValue : disconnectCommandField.stringValue
+            )
         default:
             return .none
         }
@@ -833,7 +881,7 @@ final class UserModuleWizardController: NSWindowController {
     @objc private func deleteTapped() {
         guard let mod = editing else { return }
         let alert = NSAlert()
-        alert.messageText     = "Delete \"\(mod.name)\"?"
+        alert.messageText     = "Delete latch \"\(mod.name)\"?"
         alert.informativeText = "This cannot be undone."
         alert.alertStyle      = .warning
         alert.addButton(withTitle: "Delete")
@@ -888,13 +936,18 @@ final class UserModuleWizardController: NSWindowController {
             seg?.selectedSegment = 3
             if isConnect { connectScriptField?.stringValue    = action.scriptPath ?? "" }
             else         { disconnectScriptField?.stringValue = action.scriptPath ?? "" }
+        case .runCommand:
+            seg?.selectedSegment = 4
+            if isConnect { connectCommandField?.stringValue    = action.command ?? "" }
+            else         { disconnectCommandField?.stringValue = action.command ?? "" }
         }
         if let s = seg { updateActionVisibility(
             segment: s,
-            appField:     isConnect ? connectAppField    : disconnectAppField,
-            appBrowse:    isConnect ? connectAppBrowse   : disconnectAppBrowse,
-            scriptField:  isConnect ? connectScriptField : disconnectScriptField,
-            scriptBrowse: isConnect ? connectScriptBrowse : disconnectScriptBrowse
+            appField:      isConnect ? connectAppField     : disconnectAppField,
+            appBrowse:     isConnect ? connectAppBrowse    : disconnectAppBrowse,
+            scriptField:   isConnect ? connectScriptField  : disconnectScriptField,
+            scriptBrowse:  isConnect ? connectScriptBrowse : disconnectScriptBrowse,
+            commandField:  isConnect ? connectCommandField : disconnectCommandField
         )}
     }
 
@@ -936,48 +989,163 @@ final class UserModuleWizardController: NSWindowController {
     }
 }
 
-// MARK: - NSTableViewDataSource / Delegate
+// MARK: - Device detection
 
-extension UserModuleWizardController: NSTableViewDataSource, NSTableViewDelegate {
+extension UserModuleWizardController {
 
-    func numberOfRows(in tableView: NSTableView) -> Int {
-        let eventType = selectedEventType()
-        switch eventType {
-        case .usb:       return 1 + scannedUSBDevices.count   // row 0 = "Any USB device"
-        case .bluetooth: return 1 + scannedBTDevices.count    // row 0 = "Any BT device"
-        case .thunderbolt: return 0
+    @objc func detectTapped() {
+        if wizardDetectPort != nil || wizardBTObserver != nil {
+            stopWizardDetection()
+            detectButton.title = "Detect Device…"
+            detectStatusLabel.stringValue = "Detection cancelled."
+            return
         }
+        startWizardDetection()
     }
 
-    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
-        let cell = NSTextField(labelWithString: "")
-        cell.translatesAutoresizingMaskIntoConstraints = false
-
-        if row == 0 {
+    @objc func anyDeviceToggled(_ sender: NSButton) {
+        if sender.state == .on {
+            stopWizardDetection()
+            detectedVendorID = nil; detectedProductID = nil
+            detectedBTAddress = nil; detectedDeviceName = nil
+            detectButton.isEnabled = false
             let eventType = selectedEventType()
-            switch eventType {
-            case .usb:        cell.stringValue = "Any USB device"
-            case .bluetooth:  cell.stringValue = "Any Bluetooth device"
-            case .thunderbolt: cell.stringValue = ""
-            }
-            cell.textColor = .secondaryLabelColor
+            detectStatusLabel.stringValue = "Any \(eventType.rawValue.capitalized) device"
         } else {
-            let eventType = selectedEventType()
-            switch eventType {
-            case .usb:
-                let d = scannedUSBDevices[row - 1]
-                cell.stringValue = "\(d.name)  (VID: 0x\(String(d.vendorID, radix: 16, uppercase: true)))"
-            case .bluetooth:
-                let d = scannedBTDevices[row - 1]
-                cell.stringValue = "\(d.name)  (\(d.address))"
-            case .thunderbolt:
-                break
-            }
+            detectButton.isEnabled = true
+            detectStatusLabel.stringValue = "No device detected yet."
         }
-        return cell
     }
 
-    func tableViewSelectionDidChange(_ notification: Notification) {
-        selectedDeviceIndex = deviceTable.selectedRow
+    private func startWizardDetection() {
+        let eventType = selectedEventType()
+        detectButton.title = "Cancel"
+        detectStatusLabel.stringValue = eventType == .bluetooth
+            ? "Connect your Bluetooth device now…"
+            : "Plug in your USB device now…"
+
+        switch eventType {
+        case .usb:       startUSBDetection()
+        case .bluetooth: startBTDetection()
+        case .thunderbolt: return
+        }
+
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            stopWizardDetection()
+            detectButton.title = "Detect Device…"
+            if detectedDeviceName == nil {
+                detectStatusLabel.stringValue = "No device detected — try again."
+            }
+        }
+        wizardDetectTimeout = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 10, execute: work)
+    }
+
+    private func startUSBDetection() {
+        guard let port = IONotificationPortCreate(kIOMainPortDefault) else { return }
+        IONotificationPortSetDispatchQueue(port, .main)
+        wizardDetectPort = port
+
+        let rawCtx = Unmanaged.passRetained(self).toOpaque()
+        wizardDetectCtx = rawCtx
+
+        let dict = IOServiceMatching(kIOUSBDeviceClassName)! as NSMutableDictionary
+        IOServiceAddMatchingNotification(
+            port, kIOFirstMatchNotification, dict as CFMutableDictionary,
+            { ctx, iter in
+                var svc = IOIteratorNext(iter)
+                var last: io_object_t = IO_OBJECT_NULL
+                while svc != IO_OBJECT_NULL {
+                    if last != IO_OBJECT_NULL { IOObjectRelease(last) }
+                    last = svc
+                    svc  = IOIteratorNext(iter)
+                }
+                guard last != IO_OBJECT_NULL, let ctx else { return }
+                Unmanaged<UserModuleWizardController>.fromOpaque(ctx)
+                    .takeUnretainedValue().usbDeviceDetected(last)
+                IOObjectRelease(last)
+            },
+            rawCtx, &wizardDetectIter
+        )
+
+        // Drain already-connected devices so only new plug-ins fire the callback
+        var svc = IOIteratorNext(wizardDetectIter)
+        while svc != IO_OBJECT_NULL { IOObjectRelease(svc); svc = IOIteratorNext(wizardDetectIter) }
+    }
+
+    private func startBTDetection() {
+        wizardBTObserver = IOBluetoothDevice.register(
+            forConnectNotifications: self,
+            selector: #selector(btDeviceConnected(_:device:))
+        )
+    }
+
+    @objc private func btDeviceConnected(_ notification: IOBluetoothUserNotification,
+                                          device: IOBluetoothDevice) {
+        let name = device.name ?? device.addressString ?? "Bluetooth device"
+        let addr = device.addressString ?? ""
+        deviceDetected(vendorID: nil, productID: nil, btAddress: addr, name: name)
+    }
+
+    private func usbDeviceDetected(_ service: io_object_t) {
+        var props: Unmanaged<CFMutableDictionary>?
+        guard IORegistryEntryCreateCFProperties(service, &props, kCFAllocatorDefault, 0) == kIOReturnSuccess,
+              let dict      = props?.takeRetainedValue() as? [String: Any],
+              let vendorID  = (dict[kUSBVendorID]  as? NSNumber)?.intValue ?? dict[kUSBVendorID]  as? Int,
+              let productID = (dict[kUSBProductID] as? NSNumber)?.intValue ?? dict[kUSBProductID] as? Int
+        else {
+            stopWizardDetection()
+            detectButton.title = "Detect Device…"
+            detectStatusLabel.stringValue = "Could not read device — try again."
+            return
+        }
+
+        var name = dict[kUSBProductString] as? String ?? ""
+        if name.isEmpty {
+            var buf = [CChar](repeating: 0, count: 128)
+            IORegistryEntryGetName(service, &buf)
+            name = String(cString: buf)
+        }
+        if name.isEmpty { name = "USB Device \(vendorID):\(productID)" }
+
+        deviceDetected(vendorID: vendorID, productID: productID, btAddress: nil, name: name)
+    }
+
+    private func deviceDetected(vendorID: Int?, productID: Int?, btAddress: String?, name: String) {
+        stopWizardDetection()
+        detectedVendorID   = vendorID
+        detectedProductID  = productID
+        detectedBTAddress  = btAddress
+        detectedDeviceName = name
+        anyDeviceCheckbox.state = .off
+        detectButton.title = "Detect Device…"
+        detectStatusLabel.stringValue = "✓ \(name)"
+    }
+
+    func stopWizardDetection() {
+        wizardDetectTimeout?.cancel(); wizardDetectTimeout = nil
+        if let port = wizardDetectPort {
+            IONotificationPortDestroy(port)
+            wizardDetectPort = nil
+        }
+        if wizardDetectIter != IO_OBJECT_NULL {
+            IOObjectRelease(wizardDetectIter)
+            wizardDetectIter = IO_OBJECT_NULL
+        }
+        if let ctx = wizardDetectCtx {
+            Unmanaged<UserModuleWizardController>.fromOpaque(ctx).release()
+            wizardDetectCtx = nil
+        }
+        wizardBTObserver?.unregister()
+        wizardBTObserver = nil
+    }
+}
+
+// MARK: - NSWindowDelegate
+
+extension UserModuleWizardController: NSWindowDelegate {
+    func windowWillClose(_ notification: Notification) {
+        stopWizardDetection()
     }
 }

@@ -21,12 +21,6 @@ final class ModuleRegistry {
             description: "Switches input layout when a USB keyboard is connected or disconnected.",
             make:        { KeyboardSwitcher(configManager: $0) }
         ),
-        ModuleDescriptor(
-            id:          "dock-watcher",
-            displayName: "DisplayLink Dock Watcher",
-            description: "Launches DisplayLink Manager when a Dell D6000 dock connects.",
-            make:        { DockWatcher(configManager: $0) }
-        ),
     ]
 
     /// Currently active automations — built-in modules + user-defined runners

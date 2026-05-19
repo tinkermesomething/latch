@@ -1,3 +1,4 @@
+import AppKit
 import UserNotifications
 
 enum NotificationManager {
@@ -17,7 +18,25 @@ enum NotificationManager {
                     }
                 }
             case .denied:
-                log("NotificationManager: previously denied — open System Settings > Notifications to re-enable")
+                log("NotificationManager: denied — prompting user once per version")
+                let version   = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? ""
+                let shownFor  = UserDefaults.standard.string(forKey: "notifDeniedAlertVersion")
+                guard shownFor != version else { return }
+                UserDefaults.standard.set(version, forKey: "notifDeniedAlertVersion")
+                DispatchQueue.main.async {
+                    let alert = NSAlert()
+                    alert.messageText     = "Notifications are disabled"
+                    alert.informativeText = "latch notifications are off. Go to System Settings → Notifications → latch to enable them."
+                    alert.alertStyle      = .warning
+                    alert.addButton(withTitle: "Open Settings")
+                    alert.addButton(withTitle: "Later")
+                    NSApp.activate(ignoringOtherApps: true)
+                    if alert.runModal() == .alertFirstButtonReturn {
+                        NSWorkspace.shared.open(
+                            URL(string: "x-apple.systempreferences:com.apple.preference.notifications")!
+                        )
+                    }
+                }
             case .authorized, .provisional, .ephemeral:
                 log("NotificationManager: already authorised (\(settings.authorizationStatus.rawValue))")
             @unknown default:

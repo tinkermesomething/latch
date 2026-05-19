@@ -1,8 +1,5 @@
 import AppKit
 import Carbon.HIToolbox
-import IOKit
-import IOKit.usb
-import UniformTypeIdentifiers
 
 final class SettingsWindowController: NSObject, NSWindowDelegate {
 
@@ -26,30 +23,32 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
     private var activeDetectionCheckbox:    NSButton!
     private var keyboardUSBNotifCheckbox:   NSButton!
     private var keyboardBTNotifCheckbox:    NSButton!
-    private var dockNotifCheckbox:          NSButton!
 
-    // Dock panel — live labels updated by detect/browse
-    private var dockDeviceLabel:  NSTextField!
-    private var dockAppLabel:     NSTextField!
-    private var detectDockButton: NSButton!
-
-    // Dock detection IOKit state
-    private var detectPort:    IONotificationPortRef?
-    private var detectIter:    io_iterator_t = 0
-    private var detectCtx:     UnsafeMutableRawPointer?
-    private var detectTimeout: DispatchWorkItem?
-    private var availableLayouts:           [String] = []
+    private var availableLayouts: [String] = []
 
     private enum SidebarItem: Equatable {
-        case general, modules, keyboard, dock, notifications, userModules
+        case general, keyboard, notifications
+        case userModule(id: String, name: String)
+
         var title: String {
             switch self {
-            case .general:       return "General"
-            case .modules:       return "Modules"
-            case .keyboard:      return "Keyboard Layout"
-            case .dock:          return "Dock Watcher"
-            case .notifications: return "Notifications"
-            case .userModules:   return "My Automations"
+            case .general:                    return "General"
+            case .keyboard:                   return "Keyboard Layout"
+            case .notifications:              return "Notifications"
+            case .userModule(_, let name):    return name
+            }
+        }
+
+        static func == (lhs: SidebarItem, rhs: SidebarItem) -> Bool {
+            switch (lhs, rhs) {
+            case (.general, .general),
+                 (.keyboard, .keyboard),
+                 (.notifications, .notifications):
+                return true
+            case (.userModule(let a, _), .userModule(let b, _)):
+                return a == b
+            default:
+                return false
             }
         }
     }
@@ -57,15 +56,15 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
     private var sidebarItems: [SidebarItem] {
         let active = moduleRegistry.active
         var items: [SidebarItem] = [.general]
-        // Notifications tab appears when at least one module with notification settings is active
-        if active.contains(where: { $0.id == "keyboard-switcher" || $0.id == "dock-watcher" }) {
-            items.append(.notifications)
-        }
-        items.append(.modules)
+        // Notifications tab appears when anything that can send a notification is active/configured
+        let hasNotifications = active.contains(where: { $0.id == "keyboard-switcher" })
+            || !configManager.config.userModules.isEmpty
+        if hasNotifications { items.append(.notifications) }
         if active.contains(where: { $0.id == "keyboard-switcher" }) { items.append(.keyboard) }
-        if active.contains(where: { $0.id == "dock-watcher" })      { items.append(.dock) }
-        // Always show My Automations — it's the entry point for creating user modules
-        items.append(.userModules)
+        // One sidebar entry per user-defined latch (all, including disabled — so they remain editable)
+        for mod in configManager.config.userModules {
+            items.append(.userModule(id: mod.id, name: mod.name))
+        }
         return items
     }
 
@@ -137,11 +136,16 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
 
         // Size the window to the most content-heavy registered panel so it adapts
         // to the user's font size and control sizes — no hardcoded pixels.
+        // General uses a scroll view whose fittingSize is useless for sizing, so
+        // prefer Keyboard for measurement; fall back to a sensible minimum.
         let items = sidebarItems
-        let sizingRow = items.lastIndex(of: .keyboard) ?? items.lastIndex(of: .dock) ?? 1
-        selectRow(sizingRow)
-        content.layoutSubtreeIfNeeded()
-        w.setContentSize(content.fittingSize)
+        if let sizingRow = items.lastIndex(of: .keyboard) {
+            selectRow(sizingRow)
+            content.layoutSubtreeIfNeeded()
+            w.setContentSize(content.fittingSize)
+        } else {
+            w.setContentSize(NSSize(width: 560, height: 420))
+        }
         // Show default tab
         selectRow(0)
     }
@@ -179,12 +183,10 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         let item  = row < items.count ? items[row] : .general
         let view: NSView
         switch item {
-        case .general:       view = makeGeneralPanel()
-        case .modules:       view = makeModulesPanel()
-        case .keyboard:      view = makeKeyboardPanel()
-        case .dock:          view = makeDockPanel()
-        case .notifications: view = makeNotificationsPanel()
-        case .userModules:   view = makeUserModulesPanel()
+        case .general:                 view = makeGeneralPanel()
+        case .keyboard:                view = makeKeyboardPanel()
+        case .notifications:           view = makeNotificationsPanel()
+        case .userModule(let id, _):   view = makeLatchPanel(id: id)
         }
 
         currentDetailView?.removeFromSuperview()
@@ -202,43 +204,163 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
     // MARK: - General panel
 
     private func makeGeneralPanel() -> NSView {
+        let tabView = NSTabView()
+        tabView.addTabViewItem(makeAboutTab())
+        tabView.addTabViewItem(makeModulesTab())
+        tabView.addTabViewItem(makeLatchesTab())
+        tabView.addTabViewItem(makeBackupTab())
+        return tabView
+    }
+
+    private func makeAboutTab() -> NSTabViewItem {
+        let iconView = NSImageView()
+        iconView.image        = NSImage(named: NSImage.applicationIconName)
+        iconView.imageScaling = .scaleProportionallyUpOrDown
+        NSLayoutConstraint.activate([
+            iconView.widthAnchor.constraint(equalToConstant: 56),
+            iconView.heightAnchor.constraint(equalToConstant: 56),
+        ])
+
+        let appName = NSTextField(labelWithString: "latch")
+        appName.font = .boldSystemFont(ofSize: 15)
+
+        let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "—"
+        let versionLabel = NSTextField(labelWithString: "Version \(version)")
+        versionLabel.font      = .systemFont(ofSize: NSFont.smallSystemFontSize)
+        versionLabel.textColor = .secondaryLabelColor
+
+        let tagline = NSTextField(labelWithString: "Hardware-triggered automations for macOS")
+        tagline.font      = .systemFont(ofSize: NSFont.smallSystemFontSize)
+        tagline.textColor = .secondaryLabelColor
+
+        let linkButton = NSButton(title: "", target: self, action: #selector(openRepoTapped))
+        linkButton.attributedTitle = NSAttributedString(string: "View on GitHub", attributes: [
+            .font:            NSFont.systemFont(ofSize: NSFont.smallSystemFontSize),
+            .foregroundColor: NSColor.linkColor,
+            .underlineStyle:  NSUnderlineStyle.single.rawValue,
+        ])
+        linkButton.isBordered = false
+
+        let infoStack = NSStackView(views: [appName, versionLabel, tagline, linkButton])
+        infoStack.orientation = .vertical
+        infoStack.alignment   = .leading
+        infoStack.spacing     = 2
+        infoStack.setCustomSpacing(8, after: tagline)
+
+        let aboutRow = NSStackView(views: [iconView, infoStack])
+        aboutRow.orientation = .horizontal
+        aboutRow.alignment   = .centerY
+        aboutRow.spacing     = 16
+
+        let divider = NSBox(); divider.boxType = .separator
+
         let loginCheckbox = NSButton(
             checkboxWithTitle: "Launch at Login",
             target: self, action: #selector(launchAtLoginToggled)
         )
         loginCheckbox.state = LaunchAtLogin.isEnabled() ? .on : .off
 
-        let updateButton = NSButton(title: "Check for Updates...", target: self, action: #selector(checkForUpdatesTapped))
+        let updateButton = NSButton(title: "Check for Updates...", target: self,
+                                    action: #selector(checkForUpdatesTapped))
         updateButton.bezelStyle = .rounded
 
-        let divider     = NSBox()
-        divider.boxType = .separator
+        let stack = NSStackView(views: [aboutRow, divider, loginCheckbox, updateButton])
+        stack.orientation = .vertical
+        stack.alignment   = .leading
+        stack.spacing     = 14
+        stack.edgeInsets  = NSEdgeInsets(top: 20, left: 20, bottom: 20, right: 20)
 
-        let exportButton = NSButton(title: "Export Config Backup...", target: self, action: #selector(exportConfigTapped))
-        exportButton.bezelStyle = .rounded
+        divider.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
 
-        let importButton = NSButton(title: "Import Config...", target: self, action: #selector(importConfigTapped))
-        importButton.bezelStyle = .rounded
+        let item = NSTabViewItem()
+        item.label = "About"
+        item.view  = stack
+        return item
+    }
 
-        let importNote = NSTextField(labelWithString: "Import replaces all settings and automations.")
-        importNote.font      = .systemFont(ofSize: 11)
-        importNote.textColor = .secondaryLabelColor
+    private func makeModulesTab() -> NSTabViewItem {
+        var views: [NSView] = []
+        for (idx, desc) in ModuleRegistry.available.enumerated() {
+            let isActive = moduleRegistry.active.contains(where: { $0.id == desc.id })
+            let checkbox = NSButton(checkboxWithTitle: desc.displayName, target: self,
+                                    action: #selector(moduleToggled(_:)))
+            checkbox.state = isActive ? .on : .off
+            checkbox.tag   = idx
 
-        let divider2     = NSBox()
-        divider2.boxType = .separator
+            let descLabel = NSTextField(wrappingLabelWithString: desc.description)
+            descLabel.font      = .systemFont(ofSize: NSFont.smallSystemFontSize)
+            descLabel.textColor = .secondaryLabelColor
 
-        let stack         = NSStackView(views: [loginCheckbox, divider, updateButton, divider2,
-                                                exportButton, importButton, importNote])
+            let entry = NSStackView(views: [checkbox, descLabel])
+            entry.orientation = .vertical
+            entry.alignment   = .leading
+            entry.spacing     = 3
+            views.append(entry)
+        }
+
+        let stack = NSStackView(views: views)
         stack.orientation = .vertical
         stack.alignment   = .leading
         stack.spacing     = 16
-        stack.edgeInsets  = NSEdgeInsets(top: 32, left: 32, bottom: 32, right: 32)
+        stack.edgeInsets  = NSEdgeInsets(top: 20, left: 20, bottom: 20, right: 20)
 
-        // Dividers must span full width despite .leading alignment
-        divider.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive  = true
-        divider2.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        let item = NSTabViewItem()
+        item.label = "Modules"
+        item.view  = stack
+        return item
+    }
 
-        return stack
+    private func makeLatchesTab() -> NSTabViewItem {
+        let header = NSTextField(labelWithString: "My Latches")
+        header.font = .boldSystemFont(ofSize: 13)
+
+        let sub = NSTextField(wrappingLabelWithString:
+            "Create automations triggered by USB, Bluetooth, or Thunderbolt events.")
+        sub.font      = .systemFont(ofSize: 12)
+        sub.textColor = .secondaryLabelColor
+
+        let addButton = NSButton(title: "+ Add Latch", target: self, action: #selector(addLatchTapped))
+        addButton.bezelStyle = .rounded
+
+        let stack = NSStackView(views: [header, sub, addButton])
+        stack.orientation = .vertical
+        stack.alignment   = .leading
+        stack.spacing     = 12
+        stack.edgeInsets  = NSEdgeInsets(top: 20, left: 20, bottom: 20, right: 20)
+
+        let item = NSTabViewItem()
+        item.label = "My Latches"
+        item.view  = stack
+        return item
+    }
+
+    private func makeBackupTab() -> NSTabViewItem {
+        let exportButton = NSButton(title: "Export Config Backup...", target: self,
+                                    action: #selector(exportConfigTapped))
+        exportButton.bezelStyle = .rounded
+
+        let importButton = NSButton(title: "Import Config...", target: self,
+                                    action: #selector(importConfigTapped))
+        importButton.bezelStyle = .rounded
+
+        let note = NSTextField(labelWithString: "Import replaces all settings and latches.")
+        note.font      = .systemFont(ofSize: 11)
+        note.textColor = .secondaryLabelColor
+
+        let stack = NSStackView(views: [exportButton, importButton, note])
+        stack.orientation = .vertical
+        stack.alignment   = .leading
+        stack.spacing     = 12
+        stack.edgeInsets  = NSEdgeInsets(top: 20, left: 20, bottom: 20, right: 20)
+
+        let item = NSTabViewItem()
+        item.label = "Backup"
+        item.view  = stack
+        return item
+    }
+
+    @objc private func openRepoTapped() {
+        NSWorkspace.shared.open(URL(string: "https://github.com/tinkermesomething/latch")!)
     }
 
     @objc private func exportConfigTapped() {
@@ -304,16 +426,26 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         onCheckForUpdates?()
     }
 
-    @objc private func dockNotifToggled(_ sender: NSButton) {
-        configManager.setDockNotificationsEnabled(sender.state == .on)
-    }
-
     @objc private func keyboardUSBNotifToggled(_ sender: NSButton) {
         configManager.setKeyboardUSBNotificationsEnabled(sender.state == .on)
     }
 
     @objc private func keyboardBTNotifToggled(_ sender: NSButton) {
         configManager.setKeyboardBluetoothNotificationsEnabled(sender.state == .on)
+    }
+
+    @objc private func latchConnectNotifToggled(_ sender: NSButton) {
+        guard let id = sender.identifier?.rawValue,
+              var mod = configManager.config.userModules.first(where: { $0.id == id }) else { return }
+        mod.notifyOnConnect = sender.state == .on
+        configManager.updateUserModule(mod)
+    }
+
+    @objc private func latchDisconnectNotifToggled(_ sender: NSButton) {
+        guard let id = sender.identifier?.rawValue,
+              var mod = configManager.config.userModules.first(where: { $0.id == id }) else { return }
+        mod.notifyOnDisconnect = sender.state == .on
+        configManager.updateUserModule(mod)
     }
 
     @objc private func bluetoothToggled(_ sender: NSButton) {
@@ -330,53 +462,6 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         LaunchAtLogin.setEnabled(sender.state == .on)
     }
 
-    // MARK: - Modules panel
-
-    private func makeModulesPanel() -> NSView {
-        let v = NSView()
-
-        let header = makeLabel("Available Modules", bold: true)
-        header.translatesAutoresizingMaskIntoConstraints = false
-        v.addSubview(header)
-        NSLayoutConstraint.activate([
-            header.topAnchor.constraint(equalTo: v.topAnchor, constant: 32),
-            header.leadingAnchor.constraint(equalTo: v.leadingAnchor, constant: 32),
-        ])
-
-        // Checkbox icon + gap is ~18pt — indent description to align with checkbox title text
-        let checkboxTitleOffset: CGFloat = 32 + 18
-
-        var prevAnchor = header.bottomAnchor
-        for (idx, desc) in ModuleRegistry.available.enumerated() {
-            let isActive = moduleRegistry.active.contains(where: { $0.id == desc.id })
-
-            let checkbox   = NSButton(checkboxWithTitle: desc.displayName, target: self, action: #selector(moduleToggled(_:)))
-            checkbox.state = isActive ? .on : .off
-            checkbox.tag   = idx
-            checkbox.translatesAutoresizingMaskIntoConstraints = false
-
-            let descLabel  = NSTextField(wrappingLabelWithString: desc.description)
-            descLabel.textColor = .secondaryLabelColor
-            descLabel.font      = NSFont.systemFont(ofSize: NSFont.smallSystemFontSize)
-            descLabel.translatesAutoresizingMaskIntoConstraints = false
-
-            v.addSubview(checkbox)
-            v.addSubview(descLabel)
-            NSLayoutConstraint.activate([
-                checkbox.topAnchor.constraint(equalTo: prevAnchor, constant: idx == 0 ? 16 : 20),
-                checkbox.leadingAnchor.constraint(equalTo: v.leadingAnchor, constant: 32),
-                checkbox.trailingAnchor.constraint(lessThanOrEqualTo: v.trailingAnchor, constant: -32),
-
-                descLabel.topAnchor.constraint(equalTo: checkbox.bottomAnchor, constant: 3),
-                descLabel.leadingAnchor.constraint(equalTo: v.leadingAnchor, constant: checkboxTitleOffset),
-                descLabel.trailingAnchor.constraint(equalTo: v.trailingAnchor, constant: -32),
-            ])
-            prevAnchor = descLabel.bottomAnchor
-        }
-
-        return v
-    }
-
     @objc private func moduleToggled(_ sender: NSButton) {
         let desc = ModuleRegistry.available[sender.tag]
         if sender.state == .on {
@@ -386,10 +471,8 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         }
         // Rebuild sidebar — module tabs may appear or disappear
         tableView.reloadData()
-        // If the currently-selected row no longer exists, fall back to Modules tab
-        if selectedRow >= sidebarItems.count {
-            selectRow(1)
-        }
+        // If the currently-selected row no longer exists, fall back to General
+        if selectedRow >= sidebarItems.count { selectRow(0) }
     }
 
     // MARK: - Keyboard panel (instant-apply)
@@ -530,93 +613,6 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         pcLayoutPopup?.isEnabled  = enabled
     }
 
-    // MARK: - Dock panel
-
-    private func makeDockPanel() -> NSView {
-        let cfg = configManager.config.dockWatcher
-
-        let header = makeLabel("Dock Watcher", bold: true)
-
-        let statusText = moduleRegistry.active.first(where: { $0.id == "dock-watcher" })
-            .map { $0.status.displayString } ?? "Module not active"
-        let statusLabel       = makeLabel(statusText, bold: false)
-        statusLabel.textColor = .secondaryLabelColor
-
-        let descLabel = NSTextField(wrappingLabelWithString:
-            "Watches for a USB dock. When connected, launches the selected app. When disconnected, quits it."
-        )
-        descLabel.textColor = .secondaryLabelColor
-        descLabel.font      = NSFont.systemFont(ofSize: NSFont.smallSystemFontSize)
-
-        let divider1 = NSBox(); divider1.boxType = .separator
-
-        // Dock device row
-        let deviceSectionLabel = makeLabel("Dock Device", bold: true)
-        deviceSectionLabel.font = NSFont.boldSystemFont(ofSize: NSFont.smallSystemFontSize)
-        deviceSectionLabel.textColor = .secondaryLabelColor
-
-        let deviceTitleLabel = makeLabel("Device:", bold: false)
-        deviceTitleLabel.alignment = .right
-        deviceTitleLabel.widthAnchor.constraint(equalToConstant: 60).isActive = true
-
-        dockDeviceLabel = NSTextField(labelWithString: cfg.dockName ?? "Not configured")
-        dockDeviceLabel.textColor = cfg.dockName != nil ? .labelColor : .secondaryLabelColor
-
-        detectDockButton = NSButton(title: "Detect Dock…", target: self, action: #selector(detectDockTapped))
-        detectDockButton.bezelStyle = .rounded
-
-        let deviceRow         = NSStackView(views: [deviceTitleLabel, dockDeviceLabel, detectDockButton])
-        deviceRow.orientation = .horizontal
-        deviceRow.spacing     = 8
-        deviceRow.alignment   = .centerY
-
-        let divider2 = NSBox(); divider2.boxType = .separator
-
-        // App row
-        let appSectionLabel = makeLabel("App", bold: true)
-        appSectionLabel.font = NSFont.boldSystemFont(ofSize: NSFont.smallSystemFontSize)
-        appSectionLabel.textColor = .secondaryLabelColor
-
-        let appTitleLabel = makeLabel("App:", bold: false)
-        appTitleLabel.alignment = .right
-        appTitleLabel.widthAnchor.constraint(equalToConstant: 60).isActive = true
-
-        dockAppLabel = NSTextField(labelWithString: cfg.appName ?? "Not configured")
-        dockAppLabel.textColor = cfg.appName != nil ? .labelColor : .secondaryLabelColor
-
-        let browseButton = NSButton(title: "Browse App…", target: self, action: #selector(browseAppTapped))
-        browseButton.bezelStyle = .rounded
-
-        let appRow         = NSStackView(views: [appTitleLabel, dockAppLabel, browseButton])
-        appRow.orientation = .horizontal
-        appRow.spacing     = 8
-        appRow.alignment   = .centerY
-
-        let stack         = NSStackView(views: [header, statusLabel, descLabel, divider1,
-                                                deviceSectionLabel, deviceRow,
-                                                divider2,
-                                                appSectionLabel, appRow])
-        stack.orientation = .vertical
-        stack.alignment   = .leading
-        stack.spacing     = 12
-        stack.translatesAutoresizingMaskIntoConstraints = false
-        stack.widthAnchor.constraint(greaterThanOrEqualToConstant: 340).isActive = true
-
-        for v in ([divider1, divider2] as [NSView]) + [deviceRow, appRow, descLabel] {
-            v.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
-        }
-
-        let wrapper = NSView()
-        wrapper.addSubview(stack)
-        NSLayoutConstraint.activate([
-            stack.topAnchor.constraint(equalTo: wrapper.topAnchor,          constant:  32),
-            stack.leadingAnchor.constraint(equalTo: wrapper.leadingAnchor,   constant:  32),
-            stack.trailingAnchor.constraint(equalTo: wrapper.trailingAnchor, constant: -32),
-            stack.bottomAnchor.constraint(equalTo: wrapper.bottomAnchor,     constant: -32),
-        ])
-        return wrapper
-    }
-
     // MARK: - Notifications panel
 
     private func makeNotificationsPanel() -> NSView {
@@ -646,19 +642,27 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
             views += [divider, sectionLabel, keyboardUSBNotifCheckbox, keyboardBTNotifCheckbox]
         }
 
-        if active.contains(where: { $0.id == "dock-watcher" }) {
-            let sectionLabel = makeLabel("Dock Watcher", bold: false)
+        for mod in configManager.config.userModules {
+            let sectionLabel = makeLabel(mod.name, bold: false)
             sectionLabel.font      = NSFont.boldSystemFont(ofSize: NSFont.smallSystemFontSize)
             sectionLabel.textColor = .secondaryLabelColor
 
-            dockNotifCheckbox = NSButton(
-                checkboxWithTitle: "Dock connected / disconnected",
-                target: self, action: #selector(dockNotifToggled)
+            let connectCheck = NSButton(
+                checkboxWithTitle: "Notify when device connects",
+                target: self, action: #selector(latchConnectNotifToggled(_:))
             )
-            dockNotifCheckbox.state = configManager.config.dockWatcher.notifications ? .on : .off
+            connectCheck.state      = mod.notifyOnConnect ? .on : .off
+            connectCheck.identifier = NSUserInterfaceItemIdentifier(mod.id)
+
+            let disconnectCheck = NSButton(
+                checkboxWithTitle: "Notify when device disconnects",
+                target: self, action: #selector(latchDisconnectNotifToggled(_:))
+            )
+            disconnectCheck.state      = mod.notifyOnDisconnect ? .on : .off
+            disconnectCheck.identifier = NSUserInterfaceItemIdentifier(mod.id)
 
             let divider = NSBox(); divider.boxType = .separator
-            views += [divider, sectionLabel, dockNotifCheckbox]
+            views += [divider, sectionLabel, connectCheck, disconnectCheck]
         }
 
         let stack         = NSStackView(views: views)
@@ -684,120 +688,85 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         return wrapper
     }
 
-    // MARK: - User Modules panel
+    // MARK: - Latch panel (one per user-defined module)
 
     // Wizard controller kept alive for the window's lifetime
     private var wizardController: UserModuleWizardController?
 
-    private func makeUserModulesPanel() -> NSView {
-        let modules = configManager.config.userModules
-
-        let titleLabel = NSTextField(labelWithString: "My Automations")
-        titleLabel.font = .boldSystemFont(ofSize: 13)
-
-        let subLabel = NSTextField(wrappingLabelWithString:
-            "Create automations triggered by USB, Bluetooth, or Thunderbolt hardware events.")
-        subLabel.font      = .systemFont(ofSize: 12)
-        subLabel.textColor = .secondaryLabelColor
-
-        let addButton = NSButton(title: "+ New Automation", target: self, action: #selector(addUserModuleTapped))
-        addButton.bezelStyle = .rounded
-
-        var rows: [NSView] = [titleLabel, subLabel, addButton]
-
-        if !modules.isEmpty {
-            let sep = NSBox(); sep.boxType = .separator
-            rows.append(sep)
-
-            for mod in modules {
-                rows.append(makeUserModuleRow(mod))
-            }
-        } else {
-            let emptyLabel = NSTextField(labelWithString: "No automations yet. Click \"+\" to create one.")
-            emptyLabel.font      = .systemFont(ofSize: 12)
-            emptyLabel.textColor = .tertiaryLabelColor
-            rows.append(emptyLabel)
+    private func makeLatchPanel(id: String) -> NSView {
+        guard let mod = configManager.config.userModules.first(where: { $0.id == id }) else {
+            return NSView()
         }
 
-        let stack         = NSStackView(views: rows)
+        let nameLabel = NSTextField(labelWithString: mod.name)
+        nameLabel.font = .boldSystemFont(ofSize: 15)
+
+        let triggerLabel = NSTextField(labelWithString:
+            "\(mod.trigger.eventType.rawValue.capitalized) — \(mod.trigger.deviceName)")
+        triggerLabel.font      = .systemFont(ofSize: 12)
+        triggerLabel.textColor = .secondaryLabelColor
+
+        let divider     = NSBox()
+        divider.boxType = .separator
+
+        let toggle = NSButton(checkboxWithTitle: "Enabled", target: self, action: #selector(latchToggled(_:)))
+        toggle.state      = mod.enabled ? .on : .off
+        toggle.identifier = NSUserInterfaceItemIdentifier(mod.id)
+
+        let editButton = NSButton(title: "Edit Latch…", target: self, action: #selector(editLatchTapped(_:)))
+        editButton.bezelStyle = .rounded
+        editButton.identifier = NSUserInterfaceItemIdentifier(mod.id)
+
+        let deleteButton = NSButton(title: "Delete Latch", target: self, action: #selector(deleteLatchTapped(_:)))
+        deleteButton.bezelStyle        = .rounded
+        deleteButton.contentTintColor  = .systemRed
+        deleteButton.identifier        = NSUserInterfaceItemIdentifier(mod.id)
+
+        let stack         = NSStackView(views: [nameLabel, triggerLabel, divider, toggle, editButton, deleteButton])
         stack.orientation = .vertical
         stack.alignment   = .leading
-        stack.spacing     = 12
-        stack.edgeInsets  = NSEdgeInsets(top: 28, left: 28, bottom: 28, right: 28)
+        stack.spacing     = 16
+        stack.edgeInsets  = NSEdgeInsets(top: 32, left: 32, bottom: 32, right: 32)
 
-        // Separators span full width
-        for v in rows where v is NSBox {
-            v.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
-        }
+        divider.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
 
         return stack
     }
 
-    private func makeUserModuleRow(_ mod: UserModuleConfig) -> NSView {
-        let row = NSView()
-        row.translatesAutoresizingMaskIntoConstraints = false
-
-        let nameLabel = NSTextField(labelWithString: mod.name)
-        nameLabel.font = .systemFont(ofSize: 13)
-        nameLabel.translatesAutoresizingMaskIntoConstraints = false
-
-        let triggerLabel = NSTextField(labelWithString:
-            "\(mod.trigger.eventType.rawValue.capitalized) — \(mod.trigger.deviceName)")
-        triggerLabel.font      = .systemFont(ofSize: 11)
-        triggerLabel.textColor = .secondaryLabelColor
-        triggerLabel.translatesAutoresizingMaskIntoConstraints = false
-
-        let toggle = NSButton(checkboxWithTitle: "", target: self, action: #selector(userModuleToggled(_:)))
-        toggle.state = mod.enabled ? .on : .off
-        toggle.toolTip = "Enable / disable"
-        toggle.translatesAutoresizingMaskIntoConstraints = false
-        // Store module ID in the button's identifier so the action can find it
-        toggle.identifier = NSUserInterfaceItemIdentifier(mod.id)
-
-        let editButton = NSButton(title: "Edit", target: self, action: #selector(editUserModuleTapped(_:)))
-        editButton.bezelStyle = .rounded
-        editButton.translatesAutoresizingMaskIntoConstraints = false
-        editButton.identifier = NSUserInterfaceItemIdentifier(mod.id)
-
-        row.addSubview(toggle)
-        row.addSubview(nameLabel)
-        row.addSubview(triggerLabel)
-        row.addSubview(editButton)
-
-        NSLayoutConstraint.activate([
-            toggle.leadingAnchor.constraint(equalTo: row.leadingAnchor),
-            toggle.centerYAnchor.constraint(equalTo: row.centerYAnchor),
-
-            nameLabel.leadingAnchor.constraint(equalTo: toggle.trailingAnchor, constant: 8),
-            nameLabel.topAnchor.constraint(equalTo: row.topAnchor),
-
-            triggerLabel.leadingAnchor.constraint(equalTo: nameLabel.leadingAnchor),
-            triggerLabel.topAnchor.constraint(equalTo: nameLabel.bottomAnchor, constant: 2),
-            triggerLabel.bottomAnchor.constraint(equalTo: row.bottomAnchor),
-
-            editButton.trailingAnchor.constraint(equalTo: row.trailingAnchor),
-            editButton.centerYAnchor.constraint(equalTo: row.centerYAnchor),
-            editButton.leadingAnchor.constraint(greaterThanOrEqualTo: nameLabel.trailingAnchor, constant: 8),
-
-            row.heightAnchor.constraint(greaterThanOrEqualToConstant: 40),
-        ])
-        return row
-    }
-
-    @objc private func addUserModuleTapped() {
+    @objc private func addLatchTapped() {
         openWizard(editing: nil)
     }
 
-    @objc private func editUserModuleTapped(_ sender: NSButton) {
+    @objc private func editLatchTapped(_ sender: NSButton) {
         guard let id = sender.identifier?.rawValue,
               let mod = configManager.config.userModules.first(where: { $0.id == id }) else { return }
         openWizard(editing: mod)
     }
 
-    @objc private func userModuleToggled(_ sender: NSButton) {
+    @objc private func latchToggled(_ sender: NSButton) {
         guard let id = sender.identifier?.rawValue else { return }
         configManager.setUserModuleEnabled(id: id, enabled: sender.state == .on)
         moduleRegistry.reloadFromConfig()
+    }
+
+    @objc private func deleteLatchTapped(_ sender: NSButton) {
+        guard let id = sender.identifier?.rawValue,
+              let mod = configManager.config.userModules.first(where: { $0.id == id }) else { return }
+        let alert = NSAlert()
+        alert.messageText     = "Delete latch \"\(mod.name)\"?"
+        alert.informativeText = "This cannot be undone."
+        alert.alertStyle      = .warning
+        alert.addButton(withTitle: "Delete")
+        alert.addButton(withTitle: "Cancel")
+        alert.buttons[0].hasDestructiveAction = true
+        guard let w = window else { return }
+        alert.beginSheetModal(for: w) { [weak self] response in
+            guard let self, response == .alertFirstButtonReturn else { return }
+            self.configManager.deleteUserModule(id: id)
+            self.moduleRegistry.reloadFromConfig()
+            self.tableView.reloadData()
+            self.selectRow(0)
+        }
     }
 
     private func openWizard(editing: UserModuleConfig?) {
@@ -813,8 +782,12 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
                 self.configManager.addUserModule(module)
             }
             self.moduleRegistry.reloadFromConfig()
-            // Refresh the panel to show the updated list
-            if let idx = self.sidebarItems.firstIndex(of: .userModules) {
+            self.tableView.reloadData()
+            // Navigate to the saved latch's sidebar item
+            if let idx = self.sidebarItems.firstIndex(where: {
+                if case .userModule(let sid, _) = $0 { return sid == module.id }
+                return false
+            }) {
                 self.selectRow(idx)
             }
         }
@@ -823,147 +796,11 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
             guard let self else { return }
             self.configManager.deleteUserModule(id: id)
             self.moduleRegistry.reloadFromConfig()
-            if let idx = self.sidebarItems.firstIndex(of: .userModules) {
-                self.selectRow(idx)
-            }
+            self.tableView.reloadData()
+            self.selectRow(0)
         }
 
         wizardController?.show()
-    }
-
-    // MARK: - Dock detection
-
-    @objc private func detectDockTapped() {
-        detectDockButton.isEnabled = false
-        detectDockButton.title     = "Listening…"
-        dockDeviceLabel.stringValue = "Plug in your dock now…"
-        dockDeviceLabel.textColor   = .secondaryLabelColor
-
-        guard let port = IONotificationPortCreate(kIOMainPortDefault) else {
-            resetDetectButton()
-            return
-        }
-        IONotificationPortSetDispatchQueue(port, .main)
-        detectPort = port
-
-        let rawCtx = Unmanaged.passRetained(self).toOpaque()
-        detectCtx  = rawCtx
-
-        let dict = IOServiceMatching(kIOUSBDeviceClassName)! as NSMutableDictionary
-        IOServiceAddMatchingNotification(
-            port, kIOFirstMatchNotification, dict as CFMutableDictionary,
-            { ctx, iter in
-                var svc  = IOIteratorNext(iter)
-                var last: io_object_t = IO_OBJECT_NULL
-                while svc != IO_OBJECT_NULL {
-                    if last != IO_OBJECT_NULL { IOObjectRelease(last) }
-                    last = svc
-                    svc  = IOIteratorNext(iter)
-                }
-                guard last != IO_OBJECT_NULL, let ctx else { return }
-                Unmanaged<SettingsWindowController>.fromOpaque(ctx)
-                    .takeUnretainedValue().dockDeviceDetected(last)
-                IOObjectRelease(last)
-            },
-            rawCtx, &detectIter
-        )
-
-        // Drain initial state — already-connected devices, not new ones
-        var svc = IOIteratorNext(detectIter)
-        while svc != IO_OBJECT_NULL { IOObjectRelease(svc); svc = IOIteratorNext(detectIter) }
-
-        // 10s timeout
-        let work = DispatchWorkItem { [weak self] in
-            guard let self else { return }
-            self.stopDockDetection()
-            self.dockDeviceLabel.stringValue = self.configManager.config.dockWatcher.dockName ?? "Not configured"
-            self.dockDeviceLabel.textColor   = self.configManager.config.dockWatcher.dockName != nil ? .labelColor : .secondaryLabelColor
-            self.resetDetectButton()
-        }
-        detectTimeout = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + 10, execute: work)
-    }
-
-    private func dockDeviceDetected(_ service: io_object_t) {
-        var props: Unmanaged<CFMutableDictionary>?
-        guard IORegistryEntryCreateCFProperties(service, &props, kCFAllocatorDefault, 0) == kIOReturnSuccess,
-              let dict      = props?.takeRetainedValue() as? [String: Any],
-              let vendorID  = (dict[kUSBVendorID]  as? NSNumber)?.intValue ?? dict[kUSBVendorID]  as? Int,
-              let productID = (dict[kUSBProductID] as? NSNumber)?.intValue ?? dict[kUSBProductID] as? Int
-        else {
-            stopDockDetection()
-            dockDeviceLabel.stringValue = "Could not read device — try again"
-            resetDetectButton()
-            return
-        }
-
-        // Prefer USB product name string; fall back to IORegistry entry name
-        var name = dict[kUSBProductString] as? String ?? ""
-        if name.isEmpty {
-            var buf = [CChar](repeating: 0, count: 128)
-            IORegistryEntryGetName(service, &buf)
-            name = String(cString: buf)
-        }
-        if name.isEmpty { name = "USB Device \(vendorID):\(productID)" }
-
-        stopDockDetection()
-        log("DockWatcher detect: '\(name)' VID=\(vendorID) PID=\(productID)")
-        configManager.setDockDevice(vendorID: vendorID, productID: productID, name: name)
-        configManager.onChanged?()
-
-        dockDeviceLabel.stringValue = name
-        dockDeviceLabel.textColor   = .labelColor
-        resetDetectButton()
-    }
-
-    private func stopDockDetection() {
-        detectTimeout?.cancel(); detectTimeout = nil
-        if let p = detectPort { IONotificationPortDestroy(p); detectPort = nil }
-        if detectIter != IO_OBJECT_NULL { IOObjectRelease(detectIter); detectIter = IO_OBJECT_NULL }
-        if let ctx = detectCtx {
-            Unmanaged<SettingsWindowController>.fromOpaque(ctx).release()
-            detectCtx = nil
-        }
-    }
-
-    private func resetDetectButton() {
-        detectDockButton?.isEnabled = true
-        detectDockButton?.title     = "Detect Dock…"
-    }
-
-    // MARK: - App browse
-
-    @objc private func browseAppTapped() {
-        guard let window else { return }
-        let panel = NSOpenPanel()
-        panel.directoryURL          = URL(fileURLWithPath: "/Applications")
-        panel.allowedContentTypes   = [UTType.applicationBundle]
-        panel.allowsMultipleSelection = false
-        panel.canChooseDirectories  = false
-        panel.canChooseFiles        = true   // .app bundles are packages, treated as files by NSOpenPanel
-        panel.message               = "Choose the app to launch when your dock is connected"
-        panel.prompt                = "Select"
-        panel.beginSheetModal(for: window) { [weak self] response in
-            guard let self, response == .OK, let url = panel.url else { return }
-            guard let bundle    = Bundle(url: url),
-                  let bundleID  = bundle.bundleIdentifier
-            else {
-                let alert = NSAlert()
-                alert.messageText     = "Invalid app bundle"
-                alert.informativeText = "The selected file does not appear to be a valid app."
-                alert.alertStyle      = .warning
-                alert.addButton(withTitle: "OK")
-                alert.runModal()
-                return
-            }
-            let name = bundle.infoDictionary?["CFBundleName"] as? String
-                    ?? bundle.infoDictionary?["CFBundleDisplayName"] as? String
-                    ?? url.deletingPathExtension().lastPathComponent
-            self.configManager.setDockApp(bundleID: bundleID, name: name)
-            self.configManager.onChanged?()
-            self.dockAppLabel.stringValue = name
-            self.dockAppLabel.textColor   = .labelColor
-        }
     }
 
     // MARK: - Layout helpers

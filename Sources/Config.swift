@@ -17,7 +17,7 @@ enum TriggerEventType: String, Codable {
 }
 
 enum ActionKind: String, Codable {
-    case launchApp, quitApp, runScript, none
+    case launchApp, quitApp, runScript, runCommand, none
 }
 
 struct UserModuleAction: Codable {
@@ -25,6 +25,7 @@ struct UserModuleAction: Codable {
     var appBundleID: String?  // launchApp / quitApp
     var appName:     String?  // display only
     var scriptPath:  String?  // runScript
+    var command:     String?  // runCommand
 
     static let none = UserModuleAction(kind: .none)
 }
@@ -54,8 +55,7 @@ struct UserModuleConfig: Codable, Identifiable {
 
 struct Config: Codable {
     var keyboardSwitcher  = KeyboardSwitcherConfig()
-    var dockWatcher       = DockWatcherConfig()
-    var registeredModules = ["keyboard-switcher", "dock-watcher"]
+    var registeredModules = ["keyboard-switcher"]
     var skippedVersions   = [String]()
     var userModules:      [UserModuleConfig] = []
 
@@ -92,48 +92,13 @@ struct Config: Codable {
         }
     }
 
-    struct DockWatcherConfig: Codable {
-        var enabled:       Bool
-        var notifications: Bool
-        var dockVendorID:  Int?     // nil = not configured
-        var dockProductID: Int?
-        var dockName:      String?  // display only
-        var appBundleID:   String?  // used for launch + quit
-        var appName:       String?  // display only
-
-        init(enabled: Bool = true, notifications: Bool = true,
-             dockVendorID: Int? = nil, dockProductID: Int? = nil, dockName: String? = nil,
-             appBundleID: String? = nil, appName: String? = nil) {
-            self.enabled       = enabled
-            self.notifications = notifications
-            self.dockVendorID  = dockVendorID
-            self.dockProductID = dockProductID
-            self.dockName      = dockName
-            self.appBundleID   = appBundleID
-            self.appName       = appName
-        }
-
-        init(from decoder: Decoder) throws {
-            let c = try decoder.container(keyedBy: CodingKeys.self)
-            enabled       = try c.decodeIfPresent(Bool.self,   forKey: .enabled)       ?? true
-            notifications = try c.decodeIfPresent(Bool.self,   forKey: .notifications) ?? true
-            dockVendorID  = try c.decodeIfPresent(Int.self,    forKey: .dockVendorID)
-            dockProductID = try c.decodeIfPresent(Int.self,    forKey: .dockProductID)
-            dockName      = try c.decodeIfPresent(String.self, forKey: .dockName)
-            appBundleID   = try c.decodeIfPresent(String.self, forKey: .appBundleID)
-            appName       = try c.decodeIfPresent(String.self, forKey: .appName)
-        }
-    }
-
     init() {}
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         keyboardSwitcher  = try c.decodeIfPresent(KeyboardSwitcherConfig.self, forKey: .keyboardSwitcher) ?? KeyboardSwitcherConfig()
-        dockWatcher       = try c.decodeIfPresent(DockWatcherConfig.self,      forKey: .dockWatcher)      ?? DockWatcherConfig()
-        // Default: both modules registered — existing users keep their current setup
         registeredModules = try c.decodeIfPresent([String].self, forKey: .registeredModules)
-                         ?? ["keyboard-switcher", "dock-watcher"]
+                         ?? ["keyboard-switcher"]
         skippedVersions   = try c.decodeIfPresent([String].self, forKey: .skippedVersions) ?? []
         userModules       = try c.decodeIfPresent([UserModuleConfig].self, forKey: .userModules) ?? []
     }
@@ -189,11 +154,7 @@ final class ConfigManager {
     }
 
     func setEnabled(automationId: String, enabled: Bool) {
-        switch automationId {
-        case "keyboard-switcher": config.keyboardSwitcher.enabled = enabled
-        case "dock-watcher":      config.dockWatcher.enabled      = enabled
-        default: break
-        }
+        if automationId == "keyboard-switcher" { config.keyboardSwitcher.enabled = enabled }
         save()
     }
 
@@ -227,24 +188,6 @@ final class ConfigManager {
 
     func setKeyboardBluetoothNotificationsEnabled(_ enabled: Bool) {
         config.keyboardSwitcher.notifyBluetooth = enabled
-        save()
-    }
-
-    func setDockNotificationsEnabled(_ enabled: Bool) {
-        config.dockWatcher.notifications = enabled
-        save()
-    }
-
-    func setDockDevice(vendorID: Int, productID: Int, name: String) {
-        config.dockWatcher.dockVendorID  = vendorID
-        config.dockWatcher.dockProductID = productID
-        config.dockWatcher.dockName      = name
-        save()
-    }
-
-    func setDockApp(bundleID: String, name: String) {
-        config.dockWatcher.appBundleID = bundleID
-        config.dockWatcher.appName     = name
         save()
     }
 

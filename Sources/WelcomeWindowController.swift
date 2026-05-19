@@ -1,8 +1,5 @@
 import AppKit
 import Carbon.HIToolbox
-import IOKit
-import IOKit.usb
-import UniformTypeIdentifiers
 
 final class WelcomeWindowController: NSWindowController {
 
@@ -13,7 +10,7 @@ final class WelcomeWindowController: NSWindowController {
 
     // MARK: - Step management
 
-    private enum Step { case modules, keyboard, dock }
+    private enum Step { case modules, keyboard }
     private var steps:     [Step] = [.modules]
     private var stepIndex: Int    = 0
 
@@ -33,16 +30,6 @@ final class WelcomeWindowController: NSWindowController {
     private var macPopup:         NSPopUpButton!
     private var pcPopup:          NSPopUpButton!
     private var availableLayouts: [String] = []
-
-    // MARK: - Dock step
-
-    private var dockDeviceLabel:  NSTextField!
-    private var dockAppLabel:     NSTextField!
-    private var dockDetectButton: NSButton!
-    private var detectPort:       IONotificationPortRef?
-    private var detectIter:       io_iterator_t = 0
-    private var detectCtx:        UnsafeMutableRawPointer?
-    private var detectTimeout:    DispatchWorkItem?
 
     // MARK: - Init
 
@@ -138,7 +125,6 @@ final class WelcomeWindowController: NSWindowController {
         switch step {
         case .modules:  stepView = makeModulesView()
         case .keyboard: stepView = makeKeyboardView()
-        case .dock:     stepView = makeDockView()
         }
         stepView.translatesAutoresizingMaskIntoConstraints = false
         contentContainer.addSubview(stepView)
@@ -173,12 +159,10 @@ final class WelcomeWindowController: NSWindowController {
     // MARK: - Navigation
 
     @objc private func backTapped() {
-        stopDockDetection()
         showStep(stepIndex - 1)
     }
 
     @objc private func nextTapped() {
-        stopDockDetection()
         switch steps[stepIndex] {
         case .modules:
             commitModuleSelection()
@@ -191,8 +175,6 @@ final class WelcomeWindowController: NSWindowController {
         case .keyboard:
             commitKeyboardLayouts()
             advance()
-        case .dock:
-            advance()   // dock config already saved live via configManager mutators
         }
     }
 
@@ -222,7 +204,6 @@ final class WelcomeWindowController: NSWindowController {
         let selected = checkboxes.filter { $0.state == .on }.map { ModuleRegistry.available[$0.tag].id }
         steps = [.modules]
         if selected.contains("keyboard-switcher") { steps.append(.keyboard) }
-        if selected.contains("dock-watcher")      { steps.append(.dock)     }
     }
 
     private func makeModulesView() -> NSView {
@@ -389,190 +370,6 @@ final class WelcomeWindowController: NSWindowController {
 
     private func shortLayoutName(_ id: String) -> String {
         id.replacingOccurrences(of: "com.apple.keylayout.", with: "")
-    }
-
-    // MARK: - Dock setup
-
-    private func makeDockView() -> NSView {
-        let cfg = configManager.config.dockWatcher
-
-        let header = NSTextField(labelWithString: "Dock Watcher")
-        header.font = .boldSystemFont(ofSize: 15)
-
-        let body = NSTextField(wrappingLabelWithString:
-            "When your dock is connected, the selected app will launch automatically. " +
-            "When disconnected, it will quit. You can change this any time in Settings."
-        )
-        body.textColor = .secondaryLabelColor
-        body.font      = .systemFont(ofSize: NSFont.systemFontSize)
-
-        let divider      = NSBox(); divider.boxType = .separator
-
-        // Dock device row
-        let deviceLabel   = makeLabel("Dock:", bold: false)
-        deviceLabel.alignment = .right
-        deviceLabel.widthAnchor.constraint(equalToConstant: 40).isActive = true
-
-        dockDeviceLabel = NSTextField(labelWithString: cfg.dockName ?? "Not detected yet")
-        dockDeviceLabel.textColor = cfg.dockName != nil ? .labelColor : .secondaryLabelColor
-
-        dockDetectButton = NSButton(title: "Detect Dock…", target: self, action: #selector(detectDockTapped))
-        dockDetectButton.bezelStyle = .rounded
-
-        let deviceRow         = NSStackView(views: [deviceLabel, dockDeviceLabel, dockDetectButton])
-        deviceRow.orientation = .horizontal
-        deviceRow.spacing     = 8
-        deviceRow.alignment   = .centerY
-
-        // App row
-        let appLabel   = makeLabel("App:", bold: false)
-        appLabel.alignment = .right
-        appLabel.widthAnchor.constraint(equalToConstant: 40).isActive = true
-
-        dockAppLabel = NSTextField(labelWithString: cfg.appName ?? "Not selected yet")
-        dockAppLabel.textColor = cfg.appName != nil ? .labelColor : .secondaryLabelColor
-
-        let browseButton = NSButton(title: "Browse App…", target: self, action: #selector(browseAppTapped))
-        browseButton.bezelStyle = .rounded
-
-        let appRow         = NSStackView(views: [appLabel, dockAppLabel, browseButton])
-        appRow.orientation = .horizontal
-        appRow.spacing     = 8
-        appRow.alignment   = .centerY
-
-        let skipNote = NSTextField(labelWithString: "You can skip this and configure later in Settings.")
-        skipNote.textColor = .secondaryLabelColor
-        skipNote.font      = .systemFont(ofSize: NSFont.smallSystemFontSize)
-
-        let stack         = NSStackView(views: [header, body, divider, deviceRow, appRow, skipNote])
-        stack.orientation = .vertical
-        stack.alignment   = .leading
-        stack.spacing     = 14
-        stack.edgeInsets  = NSEdgeInsets(top: 28, left: 32, bottom: 28, right: 32)
-        stack.widthAnchor.constraint(greaterThanOrEqualToConstant: 400).isActive = true
-
-        for v in ([divider, deviceRow, appRow, body, skipNote] as [NSView]) {
-            v.widthAnchor.constraint(equalTo: stack.widthAnchor,
-                                     constant: -(stack.edgeInsets.left + stack.edgeInsets.right)).isActive = true
-        }
-        return stack
-    }
-
-    // MARK: - Dock detection (mirrors SettingsWindowController)
-
-    @objc private func detectDockTapped() {
-        dockDetectButton.isEnabled  = false
-        dockDetectButton.title      = "Listening…"
-        dockDeviceLabel.stringValue = "Plug in your dock now…"
-        dockDeviceLabel.textColor   = .secondaryLabelColor
-
-        guard let port = IONotificationPortCreate(kIOMainPortDefault) else {
-            resetDetectButton(); return
-        }
-        IONotificationPortSetDispatchQueue(port, .main)
-        detectPort = port
-
-        let rawCtx = Unmanaged.passRetained(self).toOpaque()
-        detectCtx  = rawCtx
-
-        let dict = IOServiceMatching(kIOUSBDeviceClassName)! as NSMutableDictionary
-        IOServiceAddMatchingNotification(
-            port, kIOFirstMatchNotification, dict as CFMutableDictionary,
-            { ctx, iter in
-                var svc  = IOIteratorNext(iter)
-                var last: io_object_t = IO_OBJECT_NULL
-                while svc != IO_OBJECT_NULL {
-                    if last != IO_OBJECT_NULL { IOObjectRelease(last) }
-                    last = svc; svc = IOIteratorNext(iter)
-                }
-                guard last != IO_OBJECT_NULL, let ctx else { return }
-                Unmanaged<WelcomeWindowController>.fromOpaque(ctx)
-                    .takeUnretainedValue().dockDeviceDetected(last)
-                IOObjectRelease(last)
-            },
-            rawCtx, &detectIter
-        )
-
-        // Drain initial state — already-connected devices, not new
-        var svc = IOIteratorNext(detectIter)
-        while svc != IO_OBJECT_NULL { IOObjectRelease(svc); svc = IOIteratorNext(detectIter) }
-
-        let work = DispatchWorkItem { [weak self] in
-            guard let self else { return }
-            self.stopDockDetection()
-            let saved = self.configManager.config.dockWatcher.dockName
-            self.dockDeviceLabel.stringValue = saved ?? "Not detected yet"
-            self.dockDeviceLabel.textColor   = saved != nil ? .labelColor : .secondaryLabelColor
-            self.resetDetectButton()
-        }
-        detectTimeout = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + 10, execute: work)
-    }
-
-    private func dockDeviceDetected(_ service: io_object_t) {
-        var props: Unmanaged<CFMutableDictionary>?
-        guard IORegistryEntryCreateCFProperties(service, &props, kCFAllocatorDefault, 0) == kIOReturnSuccess,
-              let dict      = props?.takeRetainedValue() as? [String: Any],
-              let vendorID  = (dict[kUSBVendorID]  as? NSNumber)?.intValue ?? dict[kUSBVendorID]  as? Int,
-              let productID = (dict[kUSBProductID] as? NSNumber)?.intValue ?? dict[kUSBProductID] as? Int
-        else {
-            stopDockDetection()
-            dockDeviceLabel.stringValue = "Could not read device — try again"
-            resetDetectButton(); return
-        }
-
-        var name = dict[kUSBProductString] as? String ?? ""
-        if name.isEmpty {
-            var buf = [CChar](repeating: 0, count: 128)
-            IORegistryEntryGetName(service, &buf)
-            name = String(cString: buf)
-        }
-        if name.isEmpty { name = "USB Device \(vendorID):\(productID)" }
-
-        stopDockDetection()
-        configManager.setDockDevice(vendorID: vendorID, productID: productID, name: name)
-
-        dockDeviceLabel.stringValue = name
-        dockDeviceLabel.textColor   = .labelColor
-        resetDetectButton()
-    }
-
-    private func stopDockDetection() {
-        detectTimeout?.cancel(); detectTimeout = nil
-        if let p = detectPort { IONotificationPortDestroy(p); detectPort = nil }
-        if detectIter != IO_OBJECT_NULL { IOObjectRelease(detectIter); detectIter = IO_OBJECT_NULL }
-        if let ctx = detectCtx {
-            Unmanaged<WelcomeWindowController>.fromOpaque(ctx).release()
-            detectCtx = nil
-        }
-    }
-
-    private func resetDetectButton() {
-        dockDetectButton?.isEnabled = true
-        dockDetectButton?.title     = "Detect Dock…"
-    }
-
-    @objc private func browseAppTapped() {
-        guard let window else { return }
-        let panel = NSOpenPanel()
-        panel.directoryURL            = URL(fileURLWithPath: "/Applications")
-        panel.allowedContentTypes     = [UTType.applicationBundle]
-        panel.allowsMultipleSelection = false
-        panel.canChooseDirectories    = false
-        panel.canChooseFiles          = true
-        panel.message                 = "Choose the app to launch when your dock is connected"
-        panel.prompt                  = "Select"
-        panel.beginSheetModal(for: window) { [weak self] response in
-            guard let self, response == .OK, let url = panel.url else { return }
-            guard let bundle   = Bundle(url: url),
-                  let bundleID = bundle.bundleIdentifier else { return }
-            let name = bundle.infoDictionary?["CFBundleName"] as? String
-                    ?? bundle.infoDictionary?["CFBundleDisplayName"] as? String
-                    ?? url.deletingPathExtension().lastPathComponent
-            self.configManager.setDockApp(bundleID: bundleID, name: name)
-            self.dockAppLabel.stringValue = name
-            self.dockAppLabel.textColor   = .labelColor
-        }
     }
 
     // MARK: - Helpers
