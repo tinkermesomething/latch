@@ -205,6 +205,7 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
 
     private func makeGeneralPanel() -> NSView {
         let tabView = NSTabView()
+        tabView.translatesAutoresizingMaskIntoConstraints = false
         tabView.addTabViewItem(makeAboutTab())
         tabView.addTabViewItem(makeModulesTab())
         tabView.addTabViewItem(makeLatchesTab())
@@ -299,10 +300,11 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         }
 
         let stack = NSStackView(views: views)
-        stack.orientation = .vertical
-        stack.alignment   = .leading
-        stack.spacing     = 16
-        stack.edgeInsets  = NSEdgeInsets(top: 20, left: 20, bottom: 20, right: 20)
+        stack.orientation    = .vertical
+        stack.alignment      = .leading
+        stack.spacing        = 16
+        stack.edgeInsets     = NSEdgeInsets(top: 20, left: 20, bottom: 20, right: 20)
+        stack.autoresizingMask = [.width, .height]
 
         let item = NSTabViewItem()
         item.label = "Modules"
@@ -323,10 +325,11 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         addButton.bezelStyle = .rounded
 
         let stack = NSStackView(views: [header, sub, addButton])
-        stack.orientation = .vertical
-        stack.alignment   = .leading
-        stack.spacing     = 12
-        stack.edgeInsets  = NSEdgeInsets(top: 20, left: 20, bottom: 20, right: 20)
+        stack.orientation    = .vertical
+        stack.alignment      = .leading
+        stack.spacing        = 12
+        stack.edgeInsets     = NSEdgeInsets(top: 20, left: 20, bottom: 20, right: 20)
+        stack.autoresizingMask = [.width, .height]
 
         let item = NSTabViewItem()
         item.label = "My Latches"
