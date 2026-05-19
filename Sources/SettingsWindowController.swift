@@ -158,8 +158,8 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         tableView.addTableColumn(col)
         tableView.headerView              = nil
         tableView.rowHeight               = 32
-        tableView.style = .sourceList
-        tableView.backgroundColor         = NSColor.controlBackgroundColor
+        tableView.style                   = .sourceList
+        tableView.backgroundColor         = .clear
         tableView.dataSource              = self
         tableView.delegate                = self
         tableView.focusRingType           = .none
@@ -169,7 +169,9 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         sv.documentView            = tableView
         sv.hasVerticalScroller     = false
         sv.hasHorizontalScroller   = false
-        sv.drawsBackground         = false
+        sv.drawsBackground         = true
+        sv.backgroundColor         = NSColor(calibratedWhite: 0.12, alpha: 1)
+        sv.appearance              = NSAppearance(named: .darkAqua)
         return sv
     }
 
